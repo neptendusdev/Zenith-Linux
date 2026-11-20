@@ -26,8 +26,7 @@ Navigateur web minimaliste construit avec Electron.
 
 ```bash
 # Cloner le repo
-git clone https://github.com/SkyNigh1/Zenith.git
-cd Zenith
+git clone https://github.com/neptendusdev/Zenith-Linux
 
 # Installer les dépendances
 npm install
@@ -37,6 +36,8 @@ npm start
 ```
 
 ## Build
+
+A faire en tant qu'administrateur
 
 ```bash
 # Windows
