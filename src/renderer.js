@@ -76,6 +76,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     initializeDownloads();
     await initializeBookmarks();
     initializePiles();
+    initializeClaudeConnect().catch(e => console.error('Claude Connect :', e));
     window.zenithAPI.onWebviewOpenUrl?.(handleWebviewOpenUrl);
     setupCollapsibleSettings();
     applyTheme(currentTheme);
@@ -183,6 +184,8 @@ function setupShortcutListener() {
       case 'open-console': openDevToolsConsole(); break;
       case 'toggle-downloads': toggleDownloadsPanel(); break;
       case 'open-history': openHistoryPage(); break;
+      case 'toggle-assistant': ccTogglePanel(); break;
+      case 'claude-connect-settings': ccTogglePanel(true); ccShowView('config'); break;
       default:
         if (action.startsWith('goto-tab-')) {
           const num = parseInt(action.split('-')[2]);
@@ -645,6 +648,7 @@ function switchToTab(tabId) {
       }
     }, 100);
   }
+  if (typeof ccUpdateContext === 'function') ccUpdateContext();
 }
 
 function switchToNextTab() { if (tabs.length <= 1) return; const i = tabs.findIndex(t => t.id === activeTabId); switchToTab(tabs[(i + 1) % tabs.length].id); }
@@ -674,7 +678,7 @@ function handleWebviewOpenUrl({ url, disposition, sourceId }) {
 }
 
 function reopenLastClosedTab() { if (!closedTabs.length) return; createNewTab(closedTabs.pop().url); }
-function updateTabTitle(tabId, title) { const tab = tabs.find(t => t.id === tabId); if (tab) { tab.title = title; const el = document.getElementById(tabId); if (el) { el.querySelector('.tab-title').textContent = title; el.title = title; }}}
+function updateTabTitle(tabId, title) { const tab = tabs.find(t => t.id === tabId); if (tab) { tab.title = title; const el = document.getElementById(tabId); if (el) { el.querySelector('.tab-title').textContent = title; el.title = title; }} if (tabId === activeTabId && typeof ccUpdateContext === 'function') ccUpdateContext(); }
 function updateTabUrl(tabId, url) { const tab = tabs.find(t => t.id === tabId); if (tab) tab.url = url; if (tabId === activeTabId) updateBookmarkStar(); }
 
 function updateTabFavicon(tabId, faviconUrl) { 
@@ -1170,6 +1174,15 @@ function showContextMenu(params, webview) {
     items.push({ separator: true });
   }
   
+  // Claude Connect : demander à Claude à propos de la sélection
+  if (params.selectionText) {
+    items.splice(items.length - 1, 0, {
+      label: 'Demander à Claude',
+      icon: CC_ICONS.spark.replace('class="icon" ', ''),
+      action: () => ccAskAboutSelection(params.selectionText, webview)
+    });
+  }
+
   // Si c'est un lien
   if (params.linkURL) {
     items.push({
@@ -1233,6 +1246,11 @@ function showContextMenu(params, webview) {
     icon: BM_ICONS.bookmark,
     action: () => bookmarkCurrentPage(),
     shortcut: 'Ctrl+D'
+  });
+  items.push({
+    label: 'Résumer la page avec Claude',
+    icon: CC_ICONS.spark.replace('class="icon" ', ''),
+    action: () => ccAskAboutPage('Résume cette page')
   });
   
   items.push({ separator: true });
@@ -4436,4 +4454,1341 @@ function closeTabFromPilePage(tabId, pileId) {
     if (activePileView !== pileId) openPilePage(pileId);
     else schedulePilePageRender();
   }
+}
+
+// ============================================================
+// ===================== CLAUDE CONNECT =======================
+// ============================================================
+/**
+ * Assistant IA intégré (panneau latéral façon Comet) et outils du navigateur.
+ * Les outils sont exécutés ici, à la demande du process principal, pour l'assistant
+ * comme pour les clients MCP (Claude Desktop, Claude Code) connectés à Zenith.
+ */
+
+const CC_ICONS = {
+  spark: '<svg class="icon" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>',
+  send: '<svg class="icon" viewBox="0 0 24 24"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>',
+  stop: '<svg class="icon" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor" stroke="none"/></svg>',
+  plus: '<svg class="icon" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+  gear: '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+  close: '<svg class="icon" viewBox="0 0 24 24"><line x1="6" y1="6" x2="18" y2="18"/><line x1="6" y1="18" x2="18" y2="6"/></svg>',
+  back: '<svg class="icon" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>',
+  check: '<svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>',
+  alert: '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+  copy: '<svg class="icon" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  retry: '<svg class="icon" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>',
+  globe: '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
+  plug: '<svg class="icon" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6M6 8h12v4a6 6 0 0 1-12 0z"/><path d="M12 18v4"/></svg>'
+};
+
+const CC_TOOL_LABELS = {
+  list_tabs: () => 'Liste des onglets',
+  open_tab: (i) => `Ouverture : ${ccShort(i.url)}`,
+  switch_tab: (i) => `Affichage de l'onglet ${i.tab_id}`,
+  close_tab: (i) => `Fermeture de l'onglet ${i.tab_id}`,
+  navigate: (i) => `Navigation : ${ccShort(i.url)}`,
+  history_navigation: (i) => ({ back: 'Page précédente', forward: 'Page suivante', reload: 'Actualisation' }[i.action] || 'Navigation'),
+  read_page: () => 'Lecture de la page',
+  get_selection: () => 'Lecture de la sélection',
+  find_in_page: (i) => `Recherche de « ${ccShort(i.query, 40)} » dans la page`,
+  get_interactive_elements: () => 'Analyse des éléments de la page',
+  click_element: (i) => `Clic sur l'élément ${i.ref}`,
+  fill_input: (i) => `Saisie dans le champ ${i.ref}`,
+  scroll_page: () => 'Défilement de la page',
+  screenshot: () => "Capture d'écran",
+  search_history: (i) => `Historique : « ${ccShort(i.query, 40)} »`,
+  list_bookmarks: () => 'Lecture des signets',
+  add_bookmark: () => 'Ajout aux signets',
+  list_notes: () => 'Lecture de la liste des notes',
+  read_note: () => "Lecture d'une note",
+  create_note: (i) => `Création de la note « ${ccShort(i.title, 40)} »`,
+  update_note: () => "Modification d'une note"
+};
+
+const CC_SUGGESTIONS = [
+  'Résume cette page',
+  'Quels sont les points clés de cette page ?',
+  'Compare mes onglets ouverts',
+  'Crée une note avec un résumé de cette page'
+];
+
+const ccState = {
+  settings: null,
+  view: 'chat',            // chat | config
+  messages: [],            // historique de la conversation ({ role, content })
+  conversationId: null,    // identifiant dans assistant-history.json
+  run: null,               // { requestId, turn, segments, text }
+  quote: null,             // { text, title, url }
+  lastUserText: ''
+};
+let ccPanelWidth = parseInt(localStorage.getItem('ccPanelWidth') || '400', 10);
+let ccRenderQueued = false;
+let ccMcpNoticeAt = 0;
+
+// ---------------------------------------------------------------
+// Utilitaires
+// ---------------------------------------------------------------
+function ccEsc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function ccShort(s, n = 60) {
+  s = String(s ?? '');
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+const ccSleep = (ms) => new Promise(r => setTimeout(r, ms));
+const ccClamp = (v, min, max, def) => {
+  const n = Number.isFinite(+v) ? Math.round(+v) : def;
+  return Math.min(max, Math.max(min, n));
+};
+
+async function ccCopy(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch {}
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch {}
+  ta.remove();
+  return ok;
+}
+
+/** Markdown -> HTML (sûr : tout est échappé avant mise en forme). notes=true : format de l'éditeur de notes. */
+function ccMarkdownToHtml(md, { notes = false } = {}) {
+  const inline = (t) => {
+    let s = ccEsc(t);
+    const codes = [];
+    s = s.replace(/`([^`]+)`/g, (m, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (m, label, url) => `<a href="${url}" data-cc-link="${url}">${label}</a>`);
+    s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)]+[^\s<).,;:!?])/g, (m, pre, url) => `${pre}<a href="${url}" data-cc-link="${url}">${url}</a>`);
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/__([^_]+)__/g, '<b>$1</b>');
+    s = s.replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, '$1<i>$2</i>').replace(/(^|\W)_([^_\s][^_]*?)_(?=\W|$)/g, '$1<i>$2</i>');
+    s = s.replace(/~~([^~]+)~~/g, notes ? '<strike>$1</strike>' : '<s>$1</s>');
+    s = s.replace(/\u0000(\d+)\u0000/g, (m, i) => `<code>${codes[+i]}</code>`);
+    return s;
+  };
+  const lines = String(md || '').replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  const para = notes ? 'div' : 'p';
+  let list = null; // { tag, items }
+  const flushList = () => {
+    if (list) { out.push(`<${list.tag}>${list.items.map(i => `<li>${i}</li>`).join('')}</${list.tag}>`); list = null; }
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const fence = line.match(/^\s*```/);
+    if (fence) {
+      flushList();
+      const code = [];
+      while (++i < lines.length && !/^\s*```/.test(lines[i])) code.push(lines[i]);
+      out.push(`<pre><code>${ccEsc(code.join('\n'))}</code></pre>`);
+      continue;
+    }
+    let m;
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      flushList();
+      const level = m[1].length;
+      const tag = notes ? (level === 1 ? 'h1' : 'h2') : `h${Math.min(6, level + 2)}`;
+      out.push(`<${tag}>${inline(m[2])}</${tag}>`);
+    } else if ((m = line.match(/^\s*[-*•]\s+(.*)$/))) {
+      if (!list || list.tag !== 'ul') { flushList(); list = { tag: 'ul', items: [] }; }
+      list.items.push(inline(m[1]));
+    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      if (!list || list.tag !== 'ol') { flushList(); list = { tag: 'ol', items: [] }; }
+      list.items.push(inline(m[1]));
+    } else if ((m = line.match(/^\s*>\s?(.*)$/))) {
+      flushList();
+      out.push(`<blockquote>${inline(m[1])}</blockquote>`);
+    } else if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) {
+      flushList();
+      out.push(notes ? '<div><br></div>' : '<hr>');
+    } else if (!line.trim()) {
+      flushList();
+      if (notes && out.length) out.push('<div><br></div>');
+    } else {
+      flushList();
+      out.push(`<${para}>${inline(line)}</${para}>`);
+    }
+  }
+  flushList();
+  if (notes) while (out.length && out[out.length - 1] === '<div><br></div>') out.pop();
+  return out.join('');
+}
+
+/** HTML d'une note -> Markdown. */
+function ccHtmlToMarkdown(html) {
+  const doc = new DOMParser().parseFromString(`<body>${html || ''}</body>`, 'text/html');
+  const inlineOf = (node) => {
+    let s = '';
+    node.childNodes.forEach(n => {
+      if (n.nodeType === 3) { s += n.textContent; return; }
+      if (n.nodeType !== 1) return;
+      const t = n.tagName;
+      const inner = inlineOf(n);
+      if (t === 'B' || t === 'STRONG') s += inner.trim() ? `**${inner}**` : inner;
+      else if (t === 'I' || t === 'EM') s += inner.trim() ? `*${inner}*` : inner;
+      else if (t === 'S' || t === 'STRIKE' || t === 'DEL') s += `~~${inner}~~`;
+      else if (t === 'CODE') s += '`' + inner + '`';
+      else if (t === 'A') s += n.getAttribute('href') ? `[${inner}](${n.getAttribute('href')})` : inner;
+      else if (t === 'BR') s += '\n';
+      else s += inner;
+    });
+    return s;
+  };
+  const wrapInline = (n) => { const w = doc.createElement('span'); w.appendChild(n.cloneNode(true)); return w; };
+  const lines = [];
+  const BLOCK = /^(DIV|P|H\d|UL|OL|LI|BLOCKQUOTE|PRE|HR)$/;
+  const block = (node) => {
+    // Les nœuds "en ligne" consécutifs (texte, gras, italique...) forment une seule ligne
+    let buf = null;
+    const flush = () => { if (buf !== null) { if (buf.trim()) lines.push(buf); buf = null; } };
+    node.childNodes.forEach(n => {
+      if (n.nodeType === 3 || (n.nodeType === 1 && !BLOCK.test(n.tagName) && n.tagName !== 'BR')) {
+        buf = (buf || '') + (n.nodeType === 3 ? n.textContent : inlineOf(wrapInline(n)));
+        return;
+      }
+      if (n.nodeType !== 1) return;
+      flush();
+      const t = n.tagName;
+      if (t === 'H1') lines.push('# ' + inlineOf(n).trim());
+      else if (t === 'H2') lines.push('## ' + inlineOf(n).trim());
+      else if (/^H[3-6]$/.test(t)) lines.push('### ' + inlineOf(n).trim());
+      else if (t === 'BLOCKQUOTE') inlineOf(n).split('\n').forEach(l => lines.push('> ' + l));
+      else if (t === 'UL' || t === 'OL') {
+        [...n.children].forEach((li, i) => lines.push((t === 'OL' ? `${i + 1}. ` : '- ') + inlineOf(li).trim()));
+      } else if (t === 'PRE') lines.push('```\n' + n.textContent + '\n```');
+      else if (t === 'DIV' || t === 'P') {
+        const hasBlocks = [...n.children].some(c => /^(DIV|P|H\d|UL|OL|BLOCKQUOTE|PRE)$/.test(c.tagName));
+        if (hasBlocks) block(n);
+        else { const s = inlineOf(n); lines.push(s.trim() ? s : ''); }
+      } else if (t === 'BR') { /* fin de ligne */ }
+      else if (t === 'HR') lines.push('---');
+    });
+    flush();
+  };
+  block(doc.body);
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// ---------------------------------------------------------------
+// Outils : onglets et pages
+// ---------------------------------------------------------------
+function ccOk(text) { return { content: [{ type: 'text', text }] }; }
+
+function ccGetTab(tabId) {
+  const tab = tabId ? tabs.find(t => t.id === tabId) : tabs.find(t => t.id === activeTabId);
+  if (!tab) throw new Error(tabId ? `Onglet introuvable : ${tabId}. Utilise list_tabs pour voir les onglets.` : 'Aucun onglet actif.');
+  return tab;
+}
+
+function ccGetWebTab(tabId) {
+  const tab = ccGetTab(tabId);
+  if (!tab.webview) throw new Error(`L'onglet ${tab.id} (« ${tab.title} ») est une page interne de Zenith, sans contenu web.`);
+  return tab;
+}
+
+function ccTabInfo(tab) {
+  let url = tab.url || '';
+  let title = tab.title || '';
+  try {
+    if (tab.webview) {
+      url = tab.webview.getURL() || url;
+      title = tab.webview.getTitle() || title;
+    }
+  } catch { /* webview pas encore prête */ }
+  const home = isHomePage(url);
+  const pile = tab.pileId && typeof piles !== 'undefined' ? piles.get(tab.pileId) : null;
+  return {
+    id: tab.id,
+    title: home ? "Page d'accueil Zenith" : title,
+    url: home ? 'zenith://home' : url,
+    isHome: home,
+    active: tab.id === activeTabId,
+    pile: pile ? (pile.name || 'pile sans nom') : null
+  };
+}
+
+function ccResolveUrl(input) {
+  const s = String(input || '').trim();
+  if (!s) throw new Error('URL vide.');
+  if (/^zenith:\/\/(bookmarks|history)$/i.test(s)) return s.toLowerCase();
+  if (/^zenith:\/\/home$/i.test(s)) return DEFAULT_PAGE;
+  if (/^https?:\/\//i.test(s)) return s;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(s) && !/^localhost:/i.test(s)) throw new Error(`Protocole non autorisé : ${s.split(':')[0]}`);
+  if (isValidUrl(s)) return 'https://' + s;
+  return SEARCH_ENGINES[currentSearchEngine].url + encodeURIComponent(s);
+}
+
+/** Exécute une fonction autonome dans la page (arguments sérialisés en JSON). */
+function ccRun(webview, fn, ...args) {
+  const code = `(${fn.toString()})(...${JSON.stringify(args)})`;
+  return Promise.race([
+    webview.executeJavaScript(code, false),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('La page ne répond pas.')), 15000))
+  ]);
+}
+
+function ccWaitForLoad(webview, timeout = 20000) {
+  return new Promise((resolve) => {
+    let started = false;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer); clearTimeout(probe);
+      webview.removeEventListener('did-start-loading', onStart);
+      webview.removeEventListener('did-stop-loading', finish);
+      webview.removeEventListener('did-fail-load', onFail);
+      setTimeout(resolve, 150);
+    };
+    const onStart = () => { started = true; };
+    const onFail = (e) => { if (e.errorCode !== -3) finish(); };
+    const timer = setTimeout(finish, timeout);
+    const probe = setTimeout(() => {
+      try { if (!started && !webview.isLoading()) finish(); } catch { finish(); }
+    }, 1500);
+    webview.addEventListener('did-start-loading', onStart);
+    webview.addEventListener('did-stop-loading', finish);
+    webview.addEventListener('did-fail-load', onFail);
+  });
+}
+
+/** Après un clic ou une saisie : laisse la page réagir, attend une éventuelle navigation. */
+async function ccSettle(webview) {
+  await ccSleep(600);
+  try { if (webview.isLoading()) await ccWaitForLoad(webview, 15000); } catch {}
+}
+
+/** Signale visuellement l'onglet sur lequel Claude agit. */
+function ccMarkActing(tab) {
+  const el = tab && document.getElementById(tab.id);
+  if (!el) return;
+  el.classList.add('cc-acting');
+  clearTimeout(el._ccActTimer);
+  el._ccActTimer = setTimeout(() => el.classList.remove('cc-acting'), 2500);
+}
+
+function ccDescribeTab(info) {
+  return `Onglet ${info.id} : « ${info.title || 'sans titre'} » — ${info.url}`;
+}
+
+// Fonctions exécutées DANS la page (doivent être autonomes)
+function ccPageRead() {
+  const meta = document.querySelector('meta[name="description"], meta[property="og:description"]');
+  const text = (document.body ? document.body.innerText : '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return { title: document.title, url: location.href, description: meta ? meta.content : '', text };
+}
+
+function ccPageInteractive(filter, limit) {
+  const sel = 'a[href], button, input:not([type="hidden"]), textarea, select, summary, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [role="menuitem"], [role="option"], [role="switch"], [role="combobox"], [contenteditable=""], [contenteditable="true"], [onclick], [tabindex]:not([tabindex="-1"])';
+  document.querySelectorAll('[data-zcc]').forEach(e => e.removeAttribute('data-zcc'));
+  const f = (filter || '').toLowerCase();
+  const out = [];
+  let n = 0;
+  for (const el of document.querySelectorAll(sel)) {
+    if (el.closest('[aria-hidden="true"]') || el.disabled) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) continue;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || +st.opacity === 0) continue;
+    const own = el.tagName === 'SELECT' || el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' ? '' : el.innerText;
+    const assoc = el.labels && el.labels[0] ? el.labels[0].innerText : '';
+    const label = (el.getAttribute('aria-label') || assoc || own || el.placeholder || (el.type !== 'password' && el.tagName !== 'SELECT' ? el.value : '') || el.title || el.alt || el.getAttribute('name') || '').trim().replace(/\s+/g, ' ').slice(0, 90);
+    if (f && !label.toLowerCase().includes(f)) continue;
+    n++;
+    el.setAttribute('data-zcc', String(n));
+    const item = { ref: n, tag: el.tagName.toLowerCase(), label };
+    const type = el.getAttribute('type') || el.getAttribute('role');
+    if (type) item.type = type;
+    if (el.tagName === 'A' && el.href) item.href = String(el.href).slice(0, 140);
+    if (el.tagName === 'SELECT') item.value = el.options[el.selectedIndex]?.text || '';
+    if ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.type !== 'password' && el.value) item.value = el.value.slice(0, 60);
+    if (el.type === 'checkbox' || el.type === 'radio') item.checked = el.checked;
+    item.visible = r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+    out.push(item);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+const CC_TOOL_HANDLERS = {
+  list_tabs() {
+    if (!tabs.length) return ccOk('Aucun onglet ouvert.');
+    return ccOk(tabs.map(t => {
+      const i = ccTabInfo(t);
+      return `${i.active ? '▶ ' : '  '}${i.id} — ${i.title || '(sans titre)'}\n    ${i.url}${i.pile ? `\n    pile : ${i.pile}` : ''}`;
+    }).join('\n'));
+  },
+
+  async open_tab({ url, background }) {
+    const target = ccResolveUrl(url);
+    const before = tabCounter;
+    createNewTab(target, { background: !!background });
+    const tab = tabs.find(t => t.id === `tab-${tabCounter}`);
+    if (!tab || tabCounter === before || !tab.webview) return ccOk(`Page ouverte : ${target}`);
+    ccMarkActing(tab);
+    await ccWaitForLoad(tab.webview);
+    return ccOk(`${ccDescribeTab(ccTabInfo(tab))}${background ? ' (ouvert en arrière-plan)' : ''}`);
+  },
+
+  switch_tab({ tab_id }) {
+    const tab = ccGetTab(tab_id);
+    switchToTab(tab.id);
+    return ccOk(`Onglet affiché. ${ccDescribeTab(ccTabInfo(tab))}`);
+  },
+
+  close_tab({ tab_id }) {
+    const tab = ccGetTab(tab_id);
+    const info = ccTabInfo(tab);
+    if (tabs.length <= 1) createNewTab(); // ne pas fermer la fenêtre avec le dernier onglet
+    closeTab(tab.id);
+    return ccOk(`Onglet fermé : « ${info.title} ».`);
+  },
+
+  async navigate({ url, tab_id }) {
+    const target = ccResolveUrl(url);
+    if (target.startsWith('zenith://')) { createNewTab(target); return ccOk(`Page ouverte : ${target}`); }
+    const tab = ccGetWebTab(tab_id);
+    tab.isNewTab = false;
+    tab.url = target;
+    tab.webview.src = target;
+    if (tab.id === activeTabId) document.getElementById('url-bar').value = target;
+    ccMarkActing(tab);
+    await ccWaitForLoad(tab.webview);
+    return ccOk(ccDescribeTab(ccTabInfo(tab)));
+  },
+
+  async history_navigation({ action, tab_id }) {
+    const tab = ccGetWebTab(tab_id);
+    const wv = tab.webview;
+    if (action === 'back') { if (!wv.canGoBack()) throw new Error("Pas de page précédente dans cet onglet."); wv.goBack(); }
+    else if (action === 'forward') { if (!wv.canGoForward()) throw new Error('Pas de page suivante dans cet onglet.'); wv.goForward(); }
+    else if (action === 'reload') wv.reload();
+    else throw new Error('Action inconnue (back, forward ou reload).');
+    ccMarkActing(tab);
+    await ccWaitForLoad(wv);
+    return ccOk(ccDescribeTab(ccTabInfo(tab)));
+  },
+
+  async read_page({ tab_id, max_chars, offset }) {
+    const tab = ccGetWebTab(tab_id);
+    const page = await ccRun(tab.webview, ccPageRead);
+    const max = ccClamp(max_chars, 500, 60000, 15000);
+    const start = ccClamp(offset, 0, Math.max(0, page.text.length), 0);
+    const chunk = page.text.slice(start, start + max);
+    const end = start + chunk.length;
+    const info = ccTabInfo(tab);
+    const head = [
+      `Titre : ${page.title || '(sans titre)'}`,
+      `URL : ${info.isHome ? 'zenith://home' : page.url}`,
+      page.description ? `Description : ${page.description}` : null,
+      `Texte (caractères ${start}–${end} sur ${page.text.length}) :`
+    ].filter(Boolean).join('\n');
+    const more = end < page.text.length ? `\n\n[… suite disponible : read_page avec offset=${end}]` : '';
+    return ccOk(`${head}\n\n${chunk || '(aucun texte visible)'}${more}`);
+  },
+
+  async get_selection({ tab_id }) {
+    const tab = ccGetWebTab(tab_id);
+    const text = await ccRun(tab.webview, () => String(window.getSelection() || ''));
+    return ccOk(text.trim() ? text : 'Aucun texte sélectionné dans la page.');
+  },
+
+  async find_in_page({ query, tab_id }) {
+    const q = String(query || '').trim();
+    if (!q) throw new Error('Texte à chercher vide.');
+    const tab = ccGetWebTab(tab_id);
+    const hits = await ccRun(tab.webview, (q) => {
+      const text = document.body ? document.body.innerText : '';
+      const lower = text.toLowerCase();
+      const needle = q.toLowerCase();
+      const res = [];
+      let i = lower.indexOf(needle);
+      let count = 0;
+      while (i !== -1) {
+        count++;
+        if (res.length < 15) res.push(text.slice(Math.max(0, i - 120), i + needle.length + 120).replace(/\s+/g, ' ').trim());
+        i = lower.indexOf(needle, i + needle.length);
+      }
+      return { count, res };
+    }, q);
+    if (!hits.count) return ccOk(`« ${q} » n'apparaît pas dans la page.`);
+    return ccOk(`${hits.count} occurrence(s) de « ${q} »${hits.count > hits.res.length ? ` (${hits.res.length} premières)` : ''} :\n` + hits.res.map((s, i) => `${i + 1}. …${s}…`).join('\n'));
+  },
+
+  async get_interactive_elements({ filter, tab_id }) {
+    const tab = ccGetWebTab(tab_id);
+    const items = await ccRun(tab.webview, ccPageInteractive, filter || '', 150);
+    if (!items.length) return ccOk(filter ? `Aucun élément interactif ne contient « ${filter} ».` : 'Aucun élément interactif visible.');
+    const lines = items.map(e => {
+      let s = `[${e.ref}] ${e.tag}${e.type ? `(${e.type})` : ''} « ${e.label || '—'} »`;
+      if (e.value) s += ` valeur=« ${e.value} »`;
+      if (e.checked !== undefined) s += e.checked ? ' [coché]' : ' [non coché]';
+      if (e.href) s += ` → ${e.href}`;
+      if (!e.visible) s += ' (hors écran)';
+      return s;
+    });
+    return ccOk(`${items.length} élément(s) — refs valables jusqu'au prochain changement de page :\n${lines.join('\n')}`);
+  },
+
+  async click_element({ ref, tab_id }) {
+    const tab = ccGetWebTab(tab_id);
+    const wv = tab.webview;
+    ccMarkActing(tab);
+    const info = await ccRun(wv, (ref) => {
+      const el = document.querySelector(`[data-zcc="${ref}"]`);
+      if (!el) return { ok: false };
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = el.getBoundingClientRect();
+      const label = (el.getAttribute('aria-label') || el.innerText || el.value || el.title || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+      return { ok: true, x: r.left + r.width / 2, y: r.top + r.height / 2, label, tag: el.tagName.toLowerCase() };
+    }, ref);
+    if (!info.ok) throw new Error(`Élément ${ref} introuvable : la page a peut-être changé. Relance get_interactive_elements.`);
+    if (tab.id === activeTabId) {
+      // Vrai clic souris (événements "de confiance"), aux coordonnées de l'élément
+      await ccSleep(120);
+      const zoom = (() => { try { return wv.getZoomFactor() || 1; } catch { return 1; } })();
+      const x = Math.round(info.x * zoom), y = Math.round(info.y * zoom);
+      wv.sendInputEvent({ type: 'mouseMove', x, y });
+      wv.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+      wv.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+    } else {
+      await ccRun(wv, (ref) => { document.querySelector(`[data-zcc="${ref}"]`)?.click(); }, ref);
+    }
+    await ccSettle(wv);
+    return ccOk(`Clic sur [${ref}] ${info.tag} « ${info.label || '—'} ». ${ccDescribeTab(ccTabInfo(tab))}`);
+  },
+
+  async fill_input({ ref, value, submit, tab_id }) {
+    const tab = ccGetWebTab(tab_id);
+    const wv = tab.webview;
+    const text = String(value ?? '');
+    ccMarkActing(tab);
+    const info = await ccRun(wv, (ref) => {
+      const el = document.querySelector(`[data-zcc="${ref}"]`);
+      if (!el) return { ok: false };
+      if (el.type === 'password') return { ok: false, password: true };
+      el.scrollIntoView({ block: 'center' });
+      el.focus();
+      if (el.tagName === 'SELECT') return { ok: true, select: true, options: [...el.options].map(o => o.text) };
+      if (el.isContentEditable) {
+        const r = document.createRange(); r.selectNodeContents(el);
+        const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+      } else if (typeof el.select === 'function') el.select();
+      return { ok: true, label: el.getAttribute('aria-label') || el.placeholder || el.getAttribute('name') || el.tagName.toLowerCase() };
+    }, ref);
+    if (info.password) throw new Error('Claude Connect ne remplit jamais les champs de mot de passe : laisse l’utilisateur le faire.');
+    if (!info.ok) throw new Error(`Élément ${ref} introuvable : la page a peut-être changé. Relance get_interactive_elements.`);
+
+    if (info.select) {
+      const chosen = await ccRun(wv, (ref, v) => {
+        const el = document.querySelector(`[data-zcc="${ref}"]`);
+        const low = v.toLowerCase();
+        const opt = [...el.options].find(o => o.text.trim().toLowerCase() === low || o.value.toLowerCase() === low)
+          || [...el.options].find(o => o.text.toLowerCase().includes(low));
+        if (!opt) return null;
+        el.value = opt.value;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return opt.text;
+      }, ref, text);
+      if (chosen === null) throw new Error(`Option « ${text} » introuvable. Options : ${info.options.slice(0, 30).join(' | ')}`);
+      return ccOk(`Option « ${chosen} » choisie dans [${ref}].`);
+    }
+
+    const setNative = () => ccRun(wv, (ref, v) => {
+      const el = document.querySelector(`[data-zcc="${ref}"]`);
+      if (!el) return false;
+      if (el.isContentEditable) { el.textContent = v; }
+      else {
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }, ref, text);
+
+    if (tab.id === activeTabId && text) {
+      wv.insertText(text); // saisie "réelle" dans le champ sélectionné
+      await ccSleep(150);
+      const current = await ccRun(wv, (ref) => {
+        const el = document.querySelector(`[data-zcc="${ref}"]`);
+        return el ? (el.isContentEditable ? el.innerText : el.value) : null;
+      }, ref);
+      if (current !== null && current.trim() !== text.trim()) await setNative();
+    } else {
+      await setNative();
+    }
+
+    if (submit) {
+      if (tab.id === activeTabId) {
+        wv.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+        wv.sendInputEvent({ type: 'char', keyCode: '\r' });
+        wv.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+      } else {
+        await ccRun(wv, (ref) => {
+          const el = document.querySelector(`[data-zcc="${ref}"]`);
+          const form = el && el.form;
+          if (form) { form.requestSubmit ? form.requestSubmit() : form.submit(); }
+        }, ref);
+      }
+      await ccSettle(wv);
+    }
+    return ccOk(`Champ [${ref}] « ${info.label} » rempli${submit ? ' et validé' : ''}. ${ccDescribeTab(ccTabInfo(tab))}`);
+  },
+
+  async scroll_page({ direction, tab_id }) {
+    const tab = ccGetWebTab(tab_id);
+    ccMarkActing(tab);
+    const pos = await ccRun(tab.webview, (dir) => {
+      const el = document.scrollingElement || document.documentElement;
+      if (dir === 'top') el.scrollTo({ top: 0 });
+      else if (dir === 'bottom') el.scrollTo({ top: el.scrollHeight });
+      else el.scrollBy({ top: (dir === 'up' ? -1 : 1) * innerHeight * 0.85 });
+      return new Promise(r => setTimeout(() => r({ y: Math.round(el.scrollTop), max: Math.round(el.scrollHeight - innerHeight) }), 250));
+    }, direction);
+    return ccOk(`Position : ${pos.y} / ${Math.max(0, pos.max)} px.`);
+  },
+
+  async screenshot({ tab_id }) {
+    const tab = ccGetWebTab(tab_id);
+    const img = await tab.webview.capturePage();
+    if (!img || img.isEmpty()) throw new Error(tab.id === activeTabId ? 'Capture vide.' : "Capture vide : l'onglet doit être affiché (utilise switch_tab).");
+    const size = img.getSize();
+    const out = size.width > 1280 ? img.resize({ width: 1280, quality: 'good' }) : img;
+    const outSize = out.getSize();
+    const data = out.toDataURL().split(',')[1];
+    return {
+      content: [
+        { type: 'image', data, mimeType: 'image/png' },
+        { type: 'text', text: `Capture de l'onglet ${tab.id} (${outSize.width}×${outSize.height}).` }
+      ]
+    };
+  },
+
+  async search_history({ query, limit }) {
+    const list = (await window.zenithAPI.searchHistory(String(query || ''))) || [];
+    const n = ccClamp(limit, 1, 100, 20);
+    if (!list.length) return ccOk(`Rien dans l'historique pour « ${query} ».`);
+    const fmt = (ts) => { try { return new Date(ts).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' }); } catch { return ''; } };
+    return ccOk(list.slice(0, n).map(h => `- ${h.title || '(sans titre)'} — ${h.url}${h.timestamp ? ` (${fmt(h.timestamp)})` : ''}`).join('\n'));
+  },
+
+  list_bookmarks({ query }) {
+    if (!bookmarksData) throw new Error('Signets non chargés.');
+    const q = String(query || '').toLowerCase();
+    const out = [];
+    bmWalk((node, parent, path) => {
+      if (node.type !== 'url') return;
+      if (q && !(`${node.title} ${node.url}`.toLowerCase().includes(q))) return;
+      const folder = path.map(bmFolderTitle).join(' › ');
+      out.push(`- ${node.title || node.url} — ${node.url}${folder ? ` [${folder}]` : ''}`);
+      if (out.length >= 300) return false;
+    });
+    return ccOk(out.length ? out.join('\n') : (q ? `Aucun signet pour « ${query} ».` : 'Aucun signet.'));
+  },
+
+  add_bookmark({ url, title }) {
+    if (!bookmarksData) throw new Error('Signets non chargés.');
+    let target = url ? ccResolveUrl(url) : null;
+    let name = title;
+    if (!target) {
+      const info = ccTabInfo(ccGetTab());
+      target = info.url;
+      name = name || info.title;
+    }
+    if (!bmIsBookmarkableUrl(target)) throw new Error('Cette page ne peut pas être ajoutée aux signets.');
+    if (bmFindByUrl(target)) return ccOk(`Déjà dans les signets : ${target}`);
+    bmAdd('bar', bmNewUrl(name || target, target));
+    return ccOk(`Signet ajouté dans la barre de signets : « ${name || target} ».`);
+  },
+
+  // ----- Notes (base IndexedDB partagée avec la page d'accueil) -----
+  async list_notes() {
+    const { folders, files } = await ccNotesAll();
+    const fmt = (ts) => { try { return new Date(ts).toLocaleDateString('fr-FR'); } catch { return ''; } };
+    const lines = [];
+    const walk = (parentId, depth) => {
+      const pad = '   '.repeat(depth);
+      folders.filter(f => f.parentId === parentId).sort((a, b) => a.name.localeCompare(b.name)).forEach(f => {
+        lines.push(`${pad}📁 ${f.name} (id ${f.id})`);
+        walk(f.id, depth + 1);
+      });
+      files.filter(f => f.parentId === parentId).sort((a, b) => a.name.localeCompare(b.name)).forEach(f => {
+        lines.push(`${pad}📄 ${f.name} — modifiée le ${fmt(f.lastModified)} (id ${f.id})`);
+      });
+    };
+    walk('root', 0);
+    return ccOk(lines.length ? lines.join('\n') : 'Aucune note pour le moment.');
+  },
+
+  async read_note({ note_id }) {
+    const file = await ccNotesGet('files', note_id);
+    if (!file) throw new Error(`Note introuvable : ${note_id}. Utilise list_notes.`);
+    const md = ccHtmlToMarkdown(file.content);
+    return ccOk(`Note « ${file.name} » (id ${file.id})\n\n${md || '(note vide)'}`);
+  },
+
+  async create_note({ title, content, folder_id }) {
+    const name = String(title || '').trim() || 'Nouvelle note';
+    const parentId = folder_id || 'root';
+    if (parentId !== 'root' && !(await ccNotesGet('folders', parentId))) throw new Error(`Dossier introuvable : ${parentId}.`);
+    const file = { id: 'file_' + Date.now(), parentId, name, content: ccMarkdownToHtml(content, { notes: true }), lastModified: Date.now() };
+    await ccNotesPut('files', file);
+    ccNotesBroadcast(file.id);
+    return ccOk(`Note « ${name} » créée (id ${file.id}). Elle est visible dans Zenith : page d'accueil > Notes.`);
+  },
+
+  async update_note({ note_id, content, mode, title }) {
+    const file = await ccNotesGet('files', note_id);
+    if (!file) throw new Error(`Note introuvable : ${note_id}. Utilise list_notes.`);
+    if (typeof content === 'string' && content.trim()) {
+      const html = ccMarkdownToHtml(content, { notes: true });
+      file.content = mode === 'replace' ? html : (file.content ? file.content + '<div><br></div>' : '') + html;
+    }
+    if (title && String(title).trim()) file.name = String(title).trim();
+    file.lastModified = Date.now();
+    await ccNotesPut('files', file);
+    ccNotesBroadcast(file.id);
+    return ccOk(`Note « ${file.name} » mise à jour (${mode === 'replace' ? 'contenu remplacé' : 'texte ajouté à la fin'}).`);
+  }
+};
+
+// ---------- Base des notes ----------
+let ccNotesDb = null;
+function ccNotesOpen() {
+  if (ccNotesDb) return Promise.resolve(ccNotesDb);
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('ZenithNotesDB', 1);
+    req.onupgradeneeded = (e) => {
+      // Même schéma que la page d'accueil (js/notes.js)
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('folders')) db.createObjectStore('folders', { keyPath: 'id' }).createIndex('parentId', 'parentId', { unique: false });
+      if (!db.objectStoreNames.contains('files')) db.createObjectStore('files', { keyPath: 'id' }).createIndex('parentId', 'parentId', { unique: false });
+      e.target.transaction.objectStore('folders').put({ id: 'root', parentId: null, name: 'Root' });
+    };
+    req.onsuccess = (e) => {
+      ccNotesDb = e.target.result;
+      ccNotesDb.onversionchange = () => { ccNotesDb.close(); ccNotesDb = null; };
+      resolve(ccNotesDb);
+    };
+    req.onerror = () => reject(new Error('Base des notes inaccessible.'));
+    req.onblocked = () => reject(new Error('Base des notes occupée, réessaie.'));
+  });
+}
+async function ccNotesTx(store, mode, fn) {
+  const db = await ccNotesOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([store], mode);
+    const req = fn(tx.objectStore(store));
+    tx.oncomplete = () => resolve(req ? req.result : undefined);
+    tx.onerror = () => reject(new Error('Erreur de la base des notes.'));
+  });
+}
+const ccNotesGet = (store, id) => ccNotesTx(store, 'readonly', s => s.get(String(id || '')));
+const ccNotesPut = (store, obj) => ccNotesTx(store, 'readwrite', s => s.put(obj));
+async function ccNotesAll() {
+  const [folders, files] = await Promise.all([
+    ccNotesTx('folders', 'readonly', s => s.getAll()),
+    ccNotesTx('files', 'readonly', s => s.getAll())
+  ]);
+  return { folders: folders || [], files: files || [] };
+}
+function ccNotesBroadcast(id) {
+  try { new BroadcastChannel('zenith-notes').postMessage({ type: 'changed', id, source: 'claude' }); } catch {}
+}
+
+// ---------- Point d'entrée des appels d'outils ----------
+async function ccHandleToolRequest({ callId, name, input, origin }) {
+  let result;
+  try {
+    const fn = CC_TOOL_HANDLERS[name];
+    if (!fn) throw new Error(`Outil inconnu : ${name}`);
+    if (origin === 'mcp') ccShowMcpActivity(name, input || {});
+    result = await fn(input || {});
+  } catch (e) {
+    result = { content: [{ type: 'text', text: e.message || String(e) }], isError: true };
+  }
+  window.zenithAPI.ccSendToolResult(callId, result);
+}
+
+function ccShowMcpActivity(name, input) {
+  const btn = document.getElementById('assistant-btn');
+  if (btn) {
+    btn.classList.add('cc-busy');
+    clearTimeout(btn._ccBusy);
+    btn._ccBusy = setTimeout(() => btn.classList.remove('cc-busy'), 2000);
+  }
+  if (Date.now() - ccMcpNoticeAt > 5 * 60 * 1000) {
+    ccMcpNoticeAt = Date.now();
+    showNotification('Claude Connect : Claude utilise Zenith (' + ccEsc((CC_TOOL_LABELS[name] || (() => name))(input)) + ')');
+  }
+}
+
+// ---------------------------------------------------------------
+// Panneau assistant
+// ---------------------------------------------------------------
+async function initializeClaudeConnect() {
+  window.zenithAPI.onCcToolRequest(ccHandleToolRequest);
+  window.zenithAPI.onCcEvent(ccHandleEvent);
+  window.zenithAPI.onCcState((s) => { ccState.settings = s; ccRefreshPanel(); });
+  ccBuildPanel();
+
+  document.getElementById('assistant-btn')?.addEventListener('click', () => ccTogglePanel());
+  document.getElementById('cc-open-assistant')?.addEventListener('click', () => { closeSettingsMenu(); ccTogglePanel(true); });
+  document.getElementById('cc-open-config')?.addEventListener('click', () => { closeSettingsMenu(); ccTogglePanel(true); ccShowView('config'); });
+
+  try { ccState.settings = await window.zenithAPI.ccGetSettings(); } catch (e) { console.error('Claude Connect :', e); }
+  ccRefreshPanel();
+  if (localStorage.getItem('ccPanelOpen') === 'true') ccTogglePanel(true, false);
+}
+
+function ccBuildPanel() {
+  const panel = document.createElement('aside');
+  panel.id = 'cc-panel';
+  panel.setAttribute('aria-label', 'Claude Connect');
+  panel.style.width = ccClamp(ccPanelWidth, 320, 720, 400) + 'px';
+  panel.innerHTML = `
+    <div class="cc-resizer" title="Redimensionner"></div>
+    <div class="cc-header">
+      <div class="cc-title"><span class="cc-logo">${CC_ICONS.spark}</span><span>Claude Connect</span></div>
+      <div class="cc-head-actions">
+        <button class="cc-icon-btn" data-cc="back" title="Retour à la conversation">${CC_ICONS.back}</button>
+        <button class="cc-icon-btn" data-cc="new" title="Nouvelle conversation">${CC_ICONS.plus}</button>
+        <button class="cc-icon-btn" data-cc="config" title="Réglages de Claude Connect">${CC_ICONS.gear}</button>
+        <button class="cc-icon-btn" data-cc="close" title="Fermer (Ctrl+Shift+A)">${CC_ICONS.close}</button>
+      </div>
+    </div>
+    <div class="cc-body">
+      <div class="cc-messages"></div>
+      <div class="cc-config"></div>
+    </div>
+    <div class="cc-composer">
+      <div class="cc-context" title="Onglet actif : Claude peut le lire si tu lui en parles">
+        <span class="cc-context-icon">${CC_ICONS.globe}</span><span class="cc-context-title"></span>
+      </div>
+      <div class="cc-quote hidden">
+        <div class="cc-quote-text"></div>
+        <button class="cc-icon-btn cc-quote-close" title="Retirer l'extrait">${CC_ICONS.close}</button>
+      </div>
+      <div class="cc-input-row">
+        <textarea class="cc-input" rows="1" placeholder="Demande à Claude…"></textarea>
+        <button class="cc-send" title="Envoyer (Entrée)">${CC_ICONS.send}</button>
+      </div>
+      <div class="cc-composer-foot">
+        <select class="cc-model-quick" title="Modèle utilisé pour les prochaines réponses"></select>
+        <div class="cc-hint">Claude peut se tromper : vérifie les informations importantes.</div>
+      </div>
+    </div>`;
+  document.getElementById('main-content').appendChild(panel);
+
+  panel.querySelector('[data-cc="close"]').addEventListener('click', () => ccTogglePanel(false));
+  panel.querySelector('[data-cc="new"]').addEventListener('click', ccNewConversation);
+  panel.querySelector('[data-cc="config"]').addEventListener('click', () => ccShowView(ccState.view === 'config' ? 'chat' : 'config'));
+  panel.querySelector('[data-cc="back"]').addEventListener('click', () => ccShowView('chat'));
+  panel.querySelector('.cc-quote-close').addEventListener('click', () => ccSetQuote(null));
+
+  const input = panel.querySelector('.cc-input');
+  input.addEventListener('input', () => ccAutosize(input));
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); ccSubmit(); }
+    if (e.key === 'Escape' && ccState.run) { e.preventDefault(); ccCancel(); }
+  });
+  panel.querySelector('.cc-send').addEventListener('click', () => (ccState.run ? ccCancel() : ccSubmit()));
+  panel.querySelector('.cc-model-quick').addEventListener('change', async (e) => {
+    ccState.settings = await window.zenithAPI.ccSetSettings({ model: e.target.value });
+    ccRefreshPanel();
+  });
+
+  // Liens dans les réponses : ouverts dans un nouvel onglet
+  panel.addEventListener('click', (e) => {
+    const a = e.target.closest('a[data-cc-link]');
+    if (!a) return;
+    e.preventDefault();
+    const url = a.getAttribute('data-cc-link');
+    if (/^https?:\/\//i.test(url)) createNewTab(url, { openerId: activeTabId });
+  });
+
+  // Redimensionnement par le bord gauche
+  const resizer = panel.querySelector('.cc-resizer');
+  resizer.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    document.body.classList.add('resizing', 'cc-resizing');
+    const onMove = (ev) => {
+      const rect = document.getElementById('main-content').getBoundingClientRect();
+      ccPanelWidth = ccClamp(rect.right - ev.clientX, 320, Math.min(720, rect.width - 320), 400);
+      panel.style.width = ccPanelWidth + 'px';
+      ccSyncDevTools();
+    };
+    const onUp = () => {
+      document.body.classList.remove('resizing', 'cc-resizing');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      localStorage.setItem('ccPanelWidth', String(ccPanelWidth));
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  ccRenderMessages();
+  ccUpdateContext();
+}
+
+function ccPanel() { return document.getElementById('cc-panel'); }
+
+function ccSyncDevTools() {
+  if (typeof devToolsOpen !== 'undefined' && devToolsOpen) window.zenithAPI.resizeDevToolsPanel(getDevToolsBounds());
+}
+
+function ccTogglePanel(force, focus = true) {
+  const panel = ccPanel();
+  if (!panel) return;
+  const open = typeof force === 'boolean' ? force : !panel.classList.contains('open');
+  panel.classList.toggle('open', open);
+  document.getElementById('assistant-btn')?.classList.toggle('active', open);
+  localStorage.setItem('ccPanelOpen', String(open));
+  requestAnimationFrame(ccSyncDevTools);
+  if (open) {
+    ccUpdateContext();
+    if (focus) setTimeout(() => panel.querySelector('.cc-input')?.focus(), 50);
+  }
+}
+
+function ccShowView(view) {
+  ccState.view = view;
+  ccRefreshPanel();
+}
+
+function ccRefreshPanel() {
+  const panel = ccPanel();
+  if (!panel) return;
+  const hasKey = !!ccState.settings?.hasKey;
+  const config = ccState.view === 'config';
+  panel.classList.toggle('cc-view-config', config);
+  panel.classList.toggle('cc-no-key', !hasKey);
+  ccRenderModelQuick();
+  if (config) ccRenderConfig();
+  else ccRenderMessages();
+}
+
+/** Sélecteur de modèle compact sous la zone de saisie (même réglage que dans les Réglages). */
+function ccRenderModelQuick() {
+  const select = ccPanel()?.querySelector('.cc-model-quick');
+  if (!select) return;
+  const s = ccState.settings || {};
+  const models = s.models || [];
+  select.hidden = !models.length;
+  select.innerHTML = models.map(m => {
+    const short = m.id === 'default' ? 'Par défaut' : m.label.split(' — ')[0];
+    return `<option value="${ccEsc(m.id)}" ${m.id === s.model ? 'selected' : ''} title="${ccEsc(m.label)}">${ccEsc(short)}</option>`;
+  }).join('');
+}
+
+function ccAutosize(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 180) + 'px';
+  ta.style.overflowY = ta.scrollHeight > 180 ? 'auto' : 'hidden';
+}
+
+function ccUpdateContext() {
+  const el = ccPanel()?.querySelector('.cc-context-title');
+  if (!el) return;
+  const tab = tabs.find(t => t.id === activeTabId);
+  if (!tab) { el.textContent = 'Aucun onglet'; return; }
+  const info = ccTabInfo(tab);
+  el.textContent = info.title || info.url || 'Nouvel onglet';
+}
+
+function ccContext() {
+  const tab = tabs.find(t => t.id === activeTabId);
+  const info = tab ? ccTabInfo(tab) : null;
+  return {
+    activeTab: info ? { id: info.id, title: info.title, url: info.url, isHome: info.isHome } : null,
+    tabCount: tabs.length
+  };
+}
+
+function ccSetQuote(quote) {
+  ccState.quote = quote && quote.text && quote.text.trim() ? { ...quote, text: quote.text.trim().slice(0, 4000) } : null;
+  const box = ccPanel()?.querySelector('.cc-quote');
+  if (!box) return;
+  box.classList.toggle('hidden', !ccState.quote);
+  box.querySelector('.cc-quote-text').textContent = ccState.quote ? ccShort(ccState.quote.text, 280) : '';
+}
+
+/** Menu contextuel : « Demander à Claude » sur une sélection. */
+function ccAskAboutSelection(text, webview) {
+  const tab = tabs.find(t => t.webview === webview) || tabs.find(t => t.id === activeTabId);
+  const info = tab ? ccTabInfo(tab) : { title: '', url: '' };
+  ccTogglePanel(true);
+  ccShowView('chat');
+  ccSetQuote({ text, title: info.title, url: info.url });
+}
+
+function ccAskAboutPage(prompt) {
+  ccTogglePanel(true);
+  ccShowView('chat');
+  ccSend(prompt);
+}
+
+function ccNewConversation() {
+  if (ccState.run) ccCancel();
+  ccState.messages = [];
+  ccState.conversationId = null;
+  ccState.run = null;
+  ccSetQuote(null);
+  ccShowView('chat');
+  ccPanel()?.querySelector('.cc-input')?.focus();
+}
+
+// ---------- Rendu de la conversation ----------
+function ccRenderMessages() {
+  const panel = ccPanel();
+  if (!panel) return;
+  const box = panel.querySelector('.cc-messages');
+  if (!ccState.settings?.hasKey) { ccRenderSetup(box); ccUpdateComposer(); return; }
+  if (!box.querySelector('.cc-turn') && !ccState.messages.length) {
+    box.innerHTML = `
+      <div class="cc-empty">
+        <div class="cc-empty-logo">${CC_ICONS.spark}</div>
+        <div class="cc-empty-title">Comment puis-je t'aider ?</div>
+        <div class="cc-empty-sub">Je peux lire cette page, chercher sur le web, agir dans tes onglets et écrire dans tes notes Zenith.</div>
+        <div class="cc-suggestions">${CC_SUGGESTIONS.map(s => `<button class="cc-chip">${ccEsc(s)}</button>`).join('')}</div>
+      </div>`;
+    box.querySelectorAll('.cc-chip').forEach(b => b.addEventListener('click', () => ccSend(b.textContent)));
+  }
+  ccUpdateComposer();
+}
+
+const CC_CLI_DOCS = 'https://claude.com/claude-code';
+
+function ccRenderSetup(box) {
+  const err = ccState.settings?.cli?.error;
+  box.innerHTML = `
+    <div class="cc-setup">
+      <div class="cc-empty-logo">${CC_ICONS.spark}</div>
+      <div class="cc-empty-title">Connecte Claude à Zenith</div>
+      <p>L'assistant utilise <b>Claude Code</b> avec ton abonnement Claude (Pro ou Max). Chaque question consomme une partie de ton abonnement.</p>
+      <ol class="cc-small cc-steps">
+        <li>Installe Claude Code (<a href="${CC_CLI_DOCS}" data-cc-link="${CC_CLI_DOCS}">guide d'installation</a>).</li>
+        <li>Dans un terminal, lance <code>claude</code> puis connecte-toi avec <code>/login</code>.</li>
+        <li>Clique sur « Rechercher Claude Code ».</li>
+      </ol>
+      <button class="cc-primary cc-cli-detect">Rechercher Claude Code</button>
+      <div class="cc-setup-msg ${err ? 'error' : ''}">${err ? ccEsc(err) : ''}</div>
+      <p class="cc-small">Installé ailleurs ? Indique le chemin dans les <a href="#" class="cc-open-config">Réglages</a>.</p>
+    </div>`;
+  const msg = box.querySelector('.cc-setup-msg');
+  box.querySelector('.cc-cli-detect').addEventListener('click', async () => {
+    msg.className = 'cc-setup-msg'; msg.textContent = 'Recherche…';
+    ccState.settings = await window.zenithAPI.ccCheckCli();
+    ccRefreshPanel();
+    if (ccState.settings?.ready) ccPanel()?.querySelector('.cc-input')?.focus();
+  });
+  box.querySelector('.cc-open-config').addEventListener('click', (e) => { e.preventDefault(); ccShowView('config'); });
+}
+
+function ccUpdateComposer() {
+  const panel = ccPanel();
+  if (!panel) return;
+  const send = panel.querySelector('.cc-send');
+  const running = !!ccState.run;
+  send.classList.toggle('stop', running);
+  send.innerHTML = running ? CC_ICONS.stop : CC_ICONS.send;
+  send.title = running ? 'Arrêter (Échap)' : 'Envoyer (Entrée)';
+  panel.querySelector('.cc-input').disabled = !ccState.settings?.hasKey;
+}
+
+function ccScrollToBottom(force = false) {
+  const box = ccPanel()?.querySelector('.cc-messages');
+  if (!box) return;
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+  if (force || nearBottom) box.scrollTop = box.scrollHeight;
+}
+
+function ccSubmit() {
+  const input = ccPanel()?.querySelector('.cc-input');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  ccAutosize(input);
+  ccSend(text);
+}
+
+function ccSend(text) {
+  if (ccState.run || !text.trim()) return;
+  if (!ccState.settings?.hasKey) { ccShowView('chat'); return; }
+  const box = ccPanel().querySelector('.cc-messages');
+  box.querySelector('.cc-empty')?.remove();
+
+  const quote = ccState.quote;
+  let content = text;
+  if (quote) {
+    content = `Extrait sélectionné dans la page « ${quote.title} » (${quote.url}) :\n"""\n${quote.text}\n"""\n\n${text}`;
+  }
+  ccSetQuote(null);
+  ccState.lastUserText = text;
+
+  const turn = document.createElement('div');
+  turn.className = 'cc-turn';
+  turn.innerHTML = `
+    <div class="cc-msg user">
+      ${quote ? `<div class="cc-msg-quote">${ccEsc(ccShort(quote.text, 300))}</div>` : ''}
+      <div class="cc-msg-text">${ccEsc(text).replace(/\n/g, '<br>')}</div>
+    </div>
+    <div class="cc-msg assistant"><div class="cc-segments"></div><div class="cc-thinking"><span></span><span></span><span></span></div></div>`;
+  box.appendChild(turn);
+  ccScrollToBottom(true);
+
+  const requestId = 'cc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+  const pending = [...ccState.messages, { role: 'user', content }];
+  if (!ccState.conversationId) ccState.conversationId = 'conv-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+  ccState.run = { requestId, turn, segments: [], pending, retry: { text, quote } };
+  ccUpdateComposer();
+  window.zenithAPI.ccChat({ requestId, messages: pending, context: ccContext(), conversationId: ccState.conversationId });
+}
+
+function ccCancel() {
+  if (ccState.run) window.zenithAPI.ccCancel(ccState.run.requestId);
+}
+
+function ccLastSegment(type) {
+  const run = ccState.run;
+  const last = run.segments[run.segments.length - 1];
+  if (last && last.type === type) return last;
+  const el = document.createElement('div');
+  el.className = type === 'text' ? 'cc-text' : 'cc-tools';
+  run.turn.querySelector('.cc-segments').appendChild(el);
+  const seg = { type, el, raw: '', tools: new Map() };
+  run.segments.push(seg);
+  return seg;
+}
+
+function ccQueueTextRender() {
+  if (ccRenderQueued) return;
+  ccRenderQueued = true;
+  requestAnimationFrame(() => {
+    ccRenderQueued = false;
+    const run = ccState.run;
+    if (!run) return;
+    run.segments.filter(s => s.type === 'text' && s.dirty).forEach(s => {
+      s.el.innerHTML = ccMarkdownToHtml(s.raw);
+      s.dirty = false;
+    });
+    ccScrollToBottom();
+  });
+}
+
+function ccHandleEvent(ev) {
+  const run = ccState.run;
+  if (!run || ev.requestId !== run.requestId) return;
+  const thinking = run.turn.querySelector('.cc-thinking');
+
+  switch (ev.type) {
+    case 'step':
+      thinking?.classList.add('show');
+      break;
+    case 'text': {
+      thinking?.classList.remove('show');
+      const seg = ccLastSegment('text');
+      seg.raw += ev.delta;
+      seg.dirty = true;
+      ccQueueTextRender();
+      break;
+    }
+    case 'tool_start': {
+      thinking?.classList.remove('show');
+      const seg = ccLastSegment('tools');
+      const row = document.createElement('div');
+      row.className = 'cc-tool running';
+      const label = (CC_TOOL_LABELS[ev.name] || (() => ev.name))(ev.input || {});
+      row.innerHTML = `<span class="cc-tool-icon"><span class="cc-spinner"></span></span><span class="cc-tool-label">${ccEsc(label)}</span>`;
+      seg.el.appendChild(row);
+      seg.tools.set(ev.id, row);
+      ccScrollToBottom();
+      break;
+    }
+    case 'tool_end': {
+      const row = run.segments.map(s => s.tools?.get(ev.id)).find(Boolean);
+      if (row) {
+        row.classList.remove('running');
+        row.classList.toggle('error', !!ev.isError);
+        row.querySelector('.cc-tool-icon').innerHTML = ev.isError ? CC_ICONS.alert : CC_ICONS.check;
+        if (ev.summary) row.title = ev.summary;
+        if (ev.isError && ev.summary) {
+          const d = document.createElement('div');
+          d.className = 'cc-tool-detail';
+          d.textContent = ev.summary;
+          row.appendChild(d);
+        }
+      }
+      thinking?.classList.add('show');
+      break;
+    }
+    case 'done': {
+      thinking?.remove();
+      run.segments.filter(s => s.type === 'text').forEach(s => { s.el.innerHTML = ccMarkdownToHtml(s.raw); });
+      ccState.messages = Array.isArray(ev.messages) ? ev.messages : run.pending;
+      const assistant = run.turn.querySelector('.cc-msg.assistant');
+      const note = { cancelled: 'Réponse interrompue.', max_tokens: 'Réponse tronquée (longueur maximale atteinte).', max_steps: "Arrêté : trop d'étapes d'affilée." }[ev.stopReason];
+      if (note) assistant.insertAdjacentHTML('beforeend', `<div class="cc-note">${note}</div>`);
+      const fullText = run.segments.filter(s => s.type === 'text').map(s => s.raw).join('\n\n').trim();
+      if (fullText) {
+        const actions = document.createElement('div');
+        actions.className = 'cc-msg-actions';
+        actions.innerHTML = `<button class="cc-icon-btn" title="Copier la réponse">${CC_ICONS.copy}</button>`;
+        actions.firstElementChild.addEventListener('click', async (e) => {
+          if (await ccCopy(fullText)) { e.currentTarget.innerHTML = CC_ICONS.check; setTimeout(() => { actions.firstElementChild.innerHTML = CC_ICONS.copy; }, 1500); }
+        });
+        assistant.appendChild(actions);
+      } else if (!run.segments.length && !note) {
+        assistant.insertAdjacentHTML('beforeend', '<div class="cc-note">(réponse vide)</div>');
+      }
+      ccState.run = null;
+      ccUpdateComposer();
+      ccScrollToBottom();
+      break;
+    }
+    case 'error': {
+      thinking?.remove();
+      const assistant = run.turn.querySelector('.cc-msg.assistant');
+      const err = document.createElement('div');
+      err.className = 'cc-error';
+      err.innerHTML = `<span class="cc-error-icon">${CC_ICONS.alert}</span><span class="cc-error-text"></span>`;
+      err.querySelector('.cc-error-text').textContent = ev.message || 'Erreur inconnue.';
+      const retry = document.createElement('button');
+      retry.className = 'cc-link-btn';
+      if (ev.needsKey) {
+        retry.textContent = 'Ouvrir les réglages';
+        retry.addEventListener('click', () => ccShowView('config'));
+      } else {
+        retry.innerHTML = `${CC_ICONS.retry} Réessayer`;
+        const { text, quote } = run.retry;
+        retry.addEventListener('click', () => { run.turn.remove(); if (quote) ccSetQuote(quote); ccSend(text); });
+      }
+      err.appendChild(retry);
+      assistant.appendChild(err);
+      ccState.run = null; // l'historique validé reste celui d'avant ce message
+      ccUpdateComposer();
+      ccScrollToBottom();
+      break;
+    }
+  }
+}
+
+// ---------- Réglages ----------
+async function ccRenderConfig() {
+  const panel = ccPanel();
+  if (!panel) return;
+  const box = panel.querySelector('.cc-config');
+  const s = ccState.settings || {};
+  const server = s.server || {};
+  const cli = s.cli || {};
+  const history = s.history || {};
+  const status = !s.mcpEnabled ? '<span class="cc-status off">Désactivé</span>'
+    : server.running ? `<span class="cc-status on">Actif sur 127.0.0.1:${s.port}</span>`
+      : server.error ? `<span class="cc-status err">${ccEsc(server.error)}</span>`
+        : '<span class="cc-status off">Démarrage…</span>';
+
+  box.innerHTML = `
+    <div class="cc-config-section">
+      <div class="cc-config-title">Assistant</div>
+      <div class="cc-row">
+        <div><div class="cc-row-label">Claude Code</div><div class="cc-small">${cli.found
+          ? `Version ${ccEsc(cli.version)} — connecté à ton abonnement Claude<br><span class="cc-path">${ccEsc(cli.path)}</span>`
+          : ccEsc(cli.error || 'Introuvable')}</div></div>
+        <div class="cc-row-actions">
+          <button class="cc-secondary" data-act="detect-cli">${cli.found ? 'Revérifier' : 'Rechercher'}</button>
+        </div>
+      </div>
+      <div class="cc-key-edit">
+        <input type="text" class="cc-field cc-cli-path" placeholder="Chemin de claude (vide = détection automatique)" value="${ccEsc(s.cliPath || '')}" spellcheck="false">
+        <button class="cc-secondary" data-act="save-cli-path">Utiliser ce chemin</button>
+        <div class="cc-setup-msg"></div>
+      </div>
+      <div class="cc-row">
+        <div><div class="cc-row-label">Historique</div><div class="cc-small">${history.count || 0} conversation${(history.count || 0) > 1 ? 's' : ''} dans <span class="cc-path">${ccEsc(history.file || 'assistant-history.json')}</span></div></div>
+        <div class="cc-row-actions">
+          ${history.count ? '<button class="cc-secondary danger" data-act="clear-history">Effacer</button>' : ''}
+        </div>
+      </div>
+      <label class="cc-row">
+        <div class="cc-row-label">Modèle</div>
+        <select class="cc-field cc-model">${(s.models || []).map(m => `<option value="${m.id}" ${m.id === s.model ? 'selected' : ''}>${ccEsc(m.label)}</option>`).join('')}</select>
+      </label>
+      <div class="cc-usage-note">
+        Chaque question (dans le panneau ou dans les notes) est décomptée de ton <b>abonnement Claude</b>, avec les mêmes limites d'utilisation que claude.ai et Claude Code. Opus consomme le plus vite, Haiku le moins. Une demande qui utilise beaucoup d'outils (lire plusieurs pages, cliquer…) consomme davantage.
+      </div>
+      <label class="cc-row cc-toggle-row">
+        <div><div class="cc-row-label">Agir sur les pages</div><div class="cc-small">Clics, saisie et défilement par Claude (assistant et MCP). Les mots de passe ne sont jamais remplis.</div></div>
+        <input type="checkbox" class="cc-switch" data-set="allowActions" ${s.allowActions ? 'checked' : ''}>
+      </label>
+    </div>
+
+    <div class="cc-config-section">
+      <div class="cc-config-title">${CC_ICONS.plug} Serveur MCP</div>
+      <label class="cc-row cc-toggle-row">
+        <div><div class="cc-row-label">Activer Claude Connect (MCP)</div><div class="cc-small">Permet à Claude Desktop ou Claude Code de piloter Zenith : onglets, pages, signets, notes.</div></div>
+        <input type="checkbox" class="cc-switch" data-set="mcpEnabled" ${s.mcpEnabled ? 'checked' : ''}>
+      </label>
+      <div class="cc-row"><div class="cc-row-label">État</div>${status}</div>
+      <div class="cc-row">
+        <div class="cc-row-label">Port</div>
+        <input type="number" class="cc-field cc-port" min="1024" max="65535" value="${s.port || ''}">
+      </div>
+      <div class="cc-mcp-help">
+        <div class="cc-row-label">Claude Desktop</div>
+        <div class="cc-small">Paramètres › Développeur › Modifier la configuration : colle ce bloc dans <code>claude_desktop_config.json</code> (fusionne-le avec un éventuel « mcpServers » existant), puis redémarre Claude.</div>
+        <button class="cc-secondary" data-act="copy-desktop">${CC_ICONS.copy} Copier la configuration Claude Desktop</button>
+        <div class="cc-row-label" style="margin-top:10px">Claude Code</div>
+        <div class="cc-small">Dans un terminal :</div>
+        <button class="cc-secondary" data-act="copy-code">${CC_ICONS.copy} Copier la commande Claude Code</button>
+        <div class="cc-small" style="margin-top:10px">Le jeton protège l'accès : ne le partage pas. Le régénérer déconnecte les clients déjà configurés.</div>
+        <button class="cc-secondary danger" data-act="regen">Régénérer le jeton</button>
+      </div>
+    </div>`;
+
+  const update = async (changes) => {
+    ccState.settings = await window.zenithAPI.ccSetSettings(changes);
+    ccRefreshPanel();
+  };
+  box.querySelectorAll('[data-set]').forEach(cb => cb.addEventListener('change', () => update({ [cb.dataset.set]: cb.checked })));
+  box.querySelector('.cc-model')?.addEventListener('change', (e) => update({ model: e.target.value }));
+  box.querySelector('.cc-port')?.addEventListener('change', (e) => {
+    const port = parseInt(e.target.value, 10);
+    if (port > 1023 && port < 65536) update({ port });
+  });
+  const cliEdit = box.querySelector('.cc-key-edit');
+  const checkCli = async (cliPath) => {
+    const msg = cliEdit.querySelector('.cc-setup-msg');
+    msg.className = 'cc-setup-msg'; msg.textContent = 'Recherche de Claude Code…';
+    ccState.settings = await window.zenithAPI.ccCheckCli(cliPath);
+    ccRefreshPanel();
+  };
+  box.querySelector('[data-act="detect-cli"]')?.addEventListener('click', () => checkCli());
+  const savePath = () => checkCli(cliEdit.querySelector('.cc-cli-path').value);
+  box.querySelector('[data-act="save-cli-path"]')?.addEventListener('click', savePath);
+  cliEdit.querySelector('.cc-cli-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') savePath(); });
+  box.querySelector('[data-act="clear-history"]')?.addEventListener('click', async () => {
+    if (!confirm("Effacer tout l'historique de l'assistant ?")) return;
+    ccState.settings = await window.zenithAPI.ccClearHistory();
+    ccRefreshPanel();
+  });
+
+  const copyBtn = (act, getText) => box.querySelector(`[data-act="${act}"]`)?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const ok = await ccCopy(await getText());
+    const old = btn.innerHTML;
+    btn.innerHTML = ok ? `${CC_ICONS.check} Copié` : 'Copie impossible';
+    setTimeout(() => { btn.innerHTML = old; }, 1600);
+  });
+  copyBtn('copy-desktop', async () => (await window.zenithAPI.ccGetConnectionInfo()).desktopConfig);
+  copyBtn('copy-code', async () => (await window.zenithAPI.ccGetConnectionInfo()).claudeCode);
+  box.querySelector('[data-act="regen"]')?.addEventListener('click', async (e) => {
+    await update({ regenerateToken: true });
+    showNotification('Nouveau jeton Claude Connect : recopie la configuration dans tes clients MCP');
+  });
 }

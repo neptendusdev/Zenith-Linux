@@ -69,5 +69,18 @@ contextBridge.exposeInMainWorld('zenithAPI', {
   getBookmarks: () => ipcRenderer.invoke('get-bookmarks'),
   saveBookmarks: (data) => ipcRenderer.send('save-bookmarks', data),
   importBookmarksFile: () => ipcRenderer.invoke('import-bookmarks-file'),
-  exportBookmarksFile: (html) => ipcRenderer.invoke('export-bookmarks-file', html)
+  exportBookmarksFile: (html) => ipcRenderer.invoke('export-bookmarks-file', html),
+
+  // Claude Connect (assistant IA + serveur MCP)
+  ccGetSettings: () => ipcRenderer.invoke('cc-get-settings'),
+  ccSetSettings: (changes) => ipcRenderer.invoke('cc-set-settings', changes),
+  ccCheckCli: (cliPath) => ipcRenderer.invoke('cc-check-cli', cliPath),
+  ccClearHistory: () => ipcRenderer.invoke('cc-clear-history'),
+  ccGetConnectionInfo: () => ipcRenderer.invoke('cc-get-connection-info'),
+  ccChat: (payload) => ipcRenderer.send('cc-chat', payload),
+  ccCancel: (requestId) => ipcRenderer.send('cc-cancel', requestId),
+  onCcEvent: (callback) => ipcRenderer.on('cc-event', (e, data) => callback(data)),
+  onCcState: (callback) => ipcRenderer.on('cc-state', (e, data) => callback(data)),
+  onCcToolRequest: (callback) => ipcRenderer.on('cc-tool-request', (e, data) => callback(data)),
+  ccSendToolResult: (callId, result) => ipcRenderer.send('cc-tool-result', { callId, result })
 });

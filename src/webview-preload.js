@@ -55,5 +55,15 @@ contextBridge.exposeInMainWorld('zenithHome', {
 
   // Historique (suggestions de recherche) - page d'accueil uniquement
   getHistory: () => isHomePage ? ipcRenderer.invoke('get-history') : Promise.resolve([]),
-  getHistorySettings: () => isHomePage ? ipcRenderer.invoke('get-history-settings') : Promise.resolve({ enabled: false })
+  getHistorySettings: () => isHomePage ? ipcRenderer.invoke('get-history-settings') : Promise.resolve({ enabled: false }),
+
+  // Claude Connect dans les notes - page d'accueil uniquement (vérifié aussi côté main)
+  ai: isHomePage ? {
+    status: () => ipcRenderer.invoke('cc-notes-status'),
+    setModel: (model) => ipcRenderer.invoke('cc-notes-set-model', model),
+    ask: (payload) => ipcRenderer.send('cc-notes-ask', payload),
+    cancel: (requestId) => ipcRenderer.send('cc-notes-cancel', requestId),
+    onEvent: (callback) => ipcRenderer.on('cc-notes-event', (e, data) => callback(data)),
+    openSettings: () => ipcRenderer.send('cc-open-settings')
+  } : null
 });

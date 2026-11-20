@@ -1401,3 +1401,446 @@ class NotesModule {
 
 // Export globally
 window.NotesModule = new NotesModule();
+
+// ============================================================
+// ============ CLAUDE CONNECT DANS LES NOTES =================
+// ============================================================
+// Panneau « Claude » dans l'éditeur de notes : résumer, améliorer, corriger, continuer,
+// structurer, traduire... sur la sélection ou toute la note, puis insérer le résultat.
+// Les appels passent par le process principal, qui lance Claude Code avec l'abonnement Claude.
+
+const NAI_ACTIONS = [
+    { id: 'summarize', icon: 'fa-align-left', label: 'Résumer', prompt: "Résume ce texte de façon claire et concise : les idées principales sous forme de liste." },
+    { id: 'improve', icon: 'fa-feather', label: 'Améliorer', prompt: "Améliore l'écriture de ce texte (clarté, fluidité, style) sans changer le sens ni la langue. Renvoie uniquement le texte réécrit." },
+    { id: 'fix', icon: 'fa-spell-check', label: 'Corriger', prompt: "Corrige l'orthographe, la grammaire et la ponctuation de ce texte sans changer le style. Renvoie uniquement le texte corrigé." },
+    { id: 'continue', icon: 'fa-forward', label: 'Continuer', prompt: "Continue ce texte dans le même style et la même langue (un ou deux paragraphes). Renvoie uniquement la suite." },
+    { id: 'structure', icon: 'fa-list-ul', label: 'Structurer', prompt: "Réorganise ce texte en une note bien structurée (titres, sous-titres, listes) en gardant tout son contenu." },
+    { id: 'revise', icon: 'fa-graduation-cap', label: 'Fiche de révision', prompt: "Transforme ce texte en fiche de révision : notions clés, définitions, puis 5 questions de révision avec leurs réponses." },
+    { id: 'explain', icon: 'fa-lightbulb', label: 'Expliquer', prompt: "Explique simplement les notions de ce texte, comme à un étudiant, avec un exemple si utile." },
+    { id: 'translate', icon: 'fa-language', label: 'Traduire', prompt: "Traduis ce texte en anglais (ou en français s'il est déjà en anglais). Renvoie uniquement la traduction." }
+];
+
+function naiEscape(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/** Markdown -> HTML au format de l'éditeur de notes (tout est échappé avant mise en forme). */
+function naiMarkdownToHtml(md, forEditor = true) {
+    const inline = (t) => {
+        let s = naiEscape(t);
+        s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+        s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/__([^_]+)__/g, '<b>$1</b>');
+        s = s.replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, '$1<i>$2</i>');
+        s = s.replace(/~~([^~]+)~~/g, '<strike>$1</strike>');
+        return s;
+    };
+    const out = [];
+    let list = null;
+    const flush = () => { if (list) { out.push(`<${list.tag}>${list.items.map(i => `<li>${i}</li>`).join('')}</${list.tag}>`); list = null; } };
+    String(md || '').replace(/\r\n?/g, '\n').split('\n').forEach(line => {
+        let m;
+        if (/^\s*```/.test(line)) return;
+        if ((m = line.match(/^(#{1,6})\s+(.*)$/))) { flush(); const tag = m[1].length === 1 ? 'h1' : 'h2'; out.push(`<${tag}>${inline(m[2])}</${tag}>`); }
+        else if ((m = line.match(/^\s*[-*•]\s+(.*)$/))) { if (!list || list.tag !== 'ul') { flush(); list = { tag: 'ul', items: [] }; } list.items.push(inline(m[1])); }
+        else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) { if (!list || list.tag !== 'ol') { flush(); list = { tag: 'ol', items: [] }; } list.items.push(inline(m[1])); }
+        else if ((m = line.match(/^\s*>\s?(.*)$/))) { flush(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); }
+        else if (!line.trim()) { flush(); if (forEditor && out.length) out.push('<div><br></div>'); }
+        else { flush(); out.push(`<div>${inline(line)}</div>`); }
+    });
+    flush();
+    while (out.length && out[out.length - 1] === '<div><br></div>') out.pop();
+    return out.join('');
+}
+
+/** HTML de l'éditeur -> Markdown (listes comprises). */
+function naiHtmlToMarkdown(html) {
+    const root = document.createElement('div');
+    root.innerHTML = html || '';
+    const inl = (node) => {
+        let s = '';
+        node.childNodes.forEach(n => {
+            if (n.nodeType === 3) { s += n.textContent; return; }
+            if (n.nodeType !== 1) return;
+            const t = n.tagName, inner = inl(n);
+            if (t === 'B' || t === 'STRONG') s += inner.trim() ? `**${inner}**` : inner;
+            else if (t === 'I' || t === 'EM') s += inner.trim() ? `*${inner}*` : inner;
+            else if (t === 'S' || t === 'STRIKE') s += `~~${inner}~~`;
+            else if (t === 'BR') s += '\n';
+            else s += inner;
+        });
+        return s;
+    };
+    const lines = [];
+    const BLOCK = /^(DIV|P|H\d|UL|OL|LI|BLOCKQUOTE|PRE|HR)$/;
+    const walk = (node) => {
+        // Les nœuds "en ligne" consécutifs (texte, gras, italique...) forment une seule ligne
+        let buf = null;
+        const flush = () => { if (buf !== null) { if (buf.trim()) lines.push(buf); buf = null; } };
+        node.childNodes.forEach(n => {
+            if (n.nodeType === 3 || (n.nodeType === 1 && !BLOCK.test(n.tagName) && n.tagName !== 'BR')) {
+                if (n.nodeType === 3) { buf = (buf || '') + n.textContent; return; }
+                const wrap = document.createElement('span'); wrap.appendChild(n.cloneNode(true));
+                buf = (buf || '') + inl(wrap);
+                return;
+            }
+            if (n.nodeType !== 1) return;
+            const t = n.tagName;
+            if (t === 'BR') { flush(); return; }
+            flush();
+            if (t === 'H1') lines.push('# ' + inl(n).trim());
+            else if (/^H[2-6]$/.test(t)) lines.push('## ' + inl(n).trim());
+            else if (t === 'BLOCKQUOTE') lines.push('> ' + inl(n).trim());
+            else if (t === 'UL' || t === 'OL') [...n.children].forEach((li, i) => lines.push((t === 'OL' ? `${i + 1}. ` : '- ') + inl(li).trim()));
+            else if (t === 'HR') lines.push('---');
+            else if ([...n.children].some(c => BLOCK.test(c.tagName))) walk(n);
+            else { const s = inl(n); lines.push(s.trim() ? s : ''); }
+        });
+        flush();
+    };
+    walk(root);
+    return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+class NotesAssistant {
+    constructor(notes) {
+        this.notes = notes;
+        this.api = (window.zenithHome && window.zenithHome.ai) || null;
+        this.messages = [];
+        this.run = null;
+        this.result = '';
+        this.savedRange = null;
+        this.scope = 'note';
+        this.lastAction = null;
+        this.isOpen = false;
+    }
+
+    init() {
+        const toolbarRight = document.querySelector('.notes-main .toolbar-right');
+        if (!toolbarRight || !this.api) return; // hors de Zenith : pas d'assistant
+
+        this.button = document.createElement('button');
+        this.button.className = 'nai-toggle';
+        this.button.id = 'aiNoteBtn';
+        this.button.title = 'Claude : assistant de notes';
+        this.button.innerHTML = '<i class="fas fa-wand-magic-sparkles"></i><span>Claude</span>';
+        toolbarRight.insertBefore(this.button, toolbarRight.firstChild);
+        this.button.addEventListener('mousedown', (e) => e.preventDefault()); // garder la sélection
+        this.button.addEventListener('click', () => this.toggle());
+
+        this.panel = document.createElement('aside');
+        this.panel.className = 'notes-ai-panel';
+        this.panel.innerHTML = `
+            <div class="nai-header">
+                <span class="nai-title"><i class="fas fa-wand-magic-sparkles"></i> Claude</span>
+                <select class="nai-model" title="Modèle (décompté de ton abonnement Claude)" hidden></select>
+                <button class="nai-icon-btn nai-close" title="Fermer"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="nai-nokey" hidden>
+                <p>Installe Claude Code et connecte-toi à ton compte Claude pour utiliser l'assistant dans tes notes. Chaque demande consomme une partie de ton abonnement.</p>
+                <button class="nai-btn primary nai-open-settings">Ouvrir les réglages</button>
+            </div>
+            <div class="nai-main">
+                <div class="nai-scope"></div>
+                <div class="nai-actions">
+                    ${NAI_ACTIONS.map(a => `<button class="nai-action" data-action="${a.id}"><i class="fas ${a.icon}"></i>${a.label}</button>`).join('')}
+                </div>
+                <div class="nai-result-wrap">
+                    <div class="nai-placeholder">Choisis une action ou pose une question sur ta note.</div>
+                    <div class="nai-result"></div>
+                    <div class="nai-status"></div>
+                </div>
+                <div class="nai-apply" hidden>
+                    <button class="nai-btn primary" data-apply="insert"><i class="fas fa-plus"></i> Insérer</button>
+                    <button class="nai-btn" data-apply="replace-selection"><i class="fas fa-i-cursor"></i> Remplacer la sélection</button>
+                    <button class="nai-btn" data-apply="replace-note"><i class="fas fa-file-pen"></i> Remplacer la note</button>
+                    <button class="nai-btn" data-apply="new-note"><i class="fas fa-file-circle-plus"></i> Nouvelle note</button>
+                    <button class="nai-btn" data-apply="copy"><i class="fas fa-copy"></i> Copier</button>
+                </div>
+                <div class="nai-ask">
+                    <textarea rows="2" placeholder="Demande à Claude… (ex. « fais-en une liste de révision »)"></textarea>
+                    <button class="nai-send" title="Envoyer (Entrée)"><i class="fas fa-arrow-up"></i></button>
+                </div>
+            </div>`;
+        this.notes.container.appendChild(this.panel);
+
+        this.resultEl = this.panel.querySelector('.nai-result');
+        this.statusEl = this.panel.querySelector('.nai-status');
+        this.input = this.panel.querySelector('.nai-ask textarea');
+        this.sendBtn = this.panel.querySelector('.nai-send');
+
+        this.panel.querySelector('.nai-close').addEventListener('click', () => this.toggle(false));
+        this.modelSelect = this.panel.querySelector('.nai-model');
+        this.modelSelect.addEventListener('change', async () => {
+            try { this.renderModels(await this.api.setModel(this.modelSelect.value)); } catch {}
+        });
+        this.panel.querySelector('.nai-open-settings').addEventListener('click', () => this.api.openSettings());
+        this.panel.querySelectorAll('.nai-action').forEach(b => {
+            b.addEventListener('mousedown', (e) => e.preventDefault());
+            b.addEventListener('click', () => this.runAction(b.dataset.action));
+        });
+        this.panel.querySelectorAll('[data-apply]').forEach(b => {
+            b.addEventListener('mousedown', (e) => e.preventDefault());
+            b.addEventListener('click', () => this.apply(b.dataset.apply));
+        });
+        this.input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); this.ask(); }
+            if (e.key === 'Escape') { e.preventDefault(); this.run ? this.cancel() : this.toggle(false); }
+        });
+        this.sendBtn.addEventListener('click', () => (this.run ? this.cancel() : this.ask()));
+
+        // Mémoriser la sélection faite dans l'éditeur
+        document.addEventListener('selectionchange', () => {
+            const sel = window.getSelection();
+            if (!sel.rangeCount || !this.notes.editor) return;
+            const range = sel.getRangeAt(0);
+            if (this.notes.editor.contains(range.commonAncestorContainer)) {
+                this.savedRange = range.cloneRange();
+                this.updateScope();
+            }
+        });
+
+        this.api.onEvent((ev) => this.onEvent(ev));
+    }
+
+    async toggle(force) {
+        const open = typeof force === 'boolean' ? force : !this.isOpen;
+        this.isOpen = open;
+        this.notes.container.classList.toggle('ai-open', open);
+        this.button.classList.toggle('active', open);
+        if (!open) return;
+        this.updateScope();
+        let status = { hasKey: false };
+        try { status = await this.api.status(); } catch {}
+        this.panel.querySelector('.nai-nokey').hidden = !!status.hasKey;
+        this.panel.querySelector('.nai-main').hidden = !status.hasKey;
+        this.renderModels(status);
+        if (status.hasKey) setTimeout(() => this.input.focus({ preventScroll: true }), 50);
+    }
+
+    /** Sélecteur de modèle (réglage partagé avec le panneau Claude Connect du navigateur). */
+    renderModels(status) {
+        if (!this.modelSelect || !status) return;
+        const models = Array.isArray(status.models) ? status.models : [];
+        this.modelSelect.hidden = !status.hasKey || !models.length;
+        this.modelSelect.innerHTML = models.map(m => {
+            const short = m.id === 'default' ? 'Par défaut' : String(m.label).split(' — ')[0];
+            return `<option value="${naiEscape(m.id)}" ${m.id === status.model ? 'selected' : ''} title="${naiEscape(m.label)}">${naiEscape(short)}</option>`;
+        }).join('');
+    }
+
+    hasSelection() {
+        const r = this.savedRange;
+        return !!(r && !r.collapsed && this.notes.editor.contains(r.commonAncestorContainer) && r.toString().trim());
+    }
+
+    updateScope() {
+        if (!this.panel) return;
+        const el = this.panel.querySelector('.nai-scope');
+        if (!this.notes.currentFileId) {
+            el.innerHTML = '<i class="fas fa-circle-info"></i> Ouvre ou crée une note pour utiliser les actions.';
+            return;
+        }
+        if (this.hasSelection()) {
+            const t = this.savedRange.toString().trim();
+            el.innerHTML = `<i class="fas fa-i-cursor"></i> Sur la sélection : « ${naiEscape(t.length > 60 ? t.slice(0, 59) + '…' : t)} »`;
+        } else {
+            el.innerHTML = '<i class="fas fa-file-lines"></i> Sur toute la note';
+        }
+    }
+
+    getSourceMarkdown() {
+        if (this.hasSelection()) {
+            const div = document.createElement('div');
+            div.appendChild(this.savedRange.cloneContents());
+            this.scope = 'selection';
+            return naiHtmlToMarkdown(div.innerHTML) || this.savedRange.toString();
+        }
+        this.scope = 'note';
+        return naiHtmlToMarkdown(this.notes.editor.innerHTML);
+    }
+
+    noteTitle() {
+        return document.getElementById('currentNoteName')?.textContent || '';
+    }
+
+    runAction(id) {
+        const action = NAI_ACTIONS.find(a => a.id === id);
+        if (!action || this.run) return;
+        if (!this.notes.currentFileId) { this.notes.showToast('Ouvre ou crée une note d\'abord', null, null, 'warning'); return; }
+        const source = this.getSourceMarkdown();
+        if (!source.trim()) { this.notes.showToast('La note est vide', null, null, 'warning'); return; }
+        this.lastAction = action;
+        this.messages = [{
+            role: 'user',
+            content: `${action.prompt}\n\nTexte (${this.scope === 'selection' ? 'extrait sélectionné' : 'note entière'}) :\n"""\n${source}\n"""`
+        }];
+        this.start();
+    }
+
+    ask() {
+        const text = this.input.value.trim();
+        if (!text || this.run) return;
+        this.input.value = '';
+        if (this.messages.length && this.result) {
+            // Suite de la conversation : affiner le dernier résultat
+            this.messages = this.messages.concat({ role: 'user', content: text });
+        } else {
+            const source = this.notes.currentFileId ? this.getSourceMarkdown() : '';
+            this.lastAction = null;
+            this.messages = [{
+                role: 'user',
+                content: source.trim()
+                    ? `${text}\n\nTexte (${this.scope === 'selection' ? 'extrait sélectionné' : 'note entière'}) :\n"""\n${source}\n"""`
+                    : text
+            }];
+        }
+        this.start();
+    }
+
+    start() {
+        this.result = '';
+        this.resultEl.innerHTML = '';
+        this.panel.querySelector('.nai-placeholder').hidden = true;
+        this.panel.querySelector('.nai-apply').hidden = true;
+        this.statusEl.className = 'nai-status working';
+        this.statusEl.innerHTML = '<span class="nai-dots"><span></span><span></span><span></span></span>';
+        this.run = { requestId: 'nai-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7) };
+        this.setRunning(true);
+        this.api.ask({ requestId: this.run.requestId, messages: this.messages, noteTitle: this.noteTitle() });
+    }
+
+    cancel() {
+        if (this.run) this.api.cancel(this.run.requestId);
+    }
+
+    setRunning(on) {
+        this.sendBtn.innerHTML = on ? '<i class="fas fa-stop"></i>' : '<i class="fas fa-arrow-up"></i>';
+        this.sendBtn.title = on ? 'Arrêter (Échap)' : 'Envoyer (Entrée)';
+        this.panel.querySelectorAll('.nai-action').forEach(b => { b.disabled = on; });
+    }
+
+    onEvent(ev) {
+        if (!this.run || ev.requestId !== this.run.requestId) return;
+        if (ev.type === 'text') {
+            this.result += ev.delta;
+            this.resultEl.innerHTML = naiMarkdownToHtml(this.result, false);
+            this.resultEl.scrollTop = this.resultEl.scrollHeight;
+        } else if (ev.type === 'done') {
+            this.run = null;
+            this.setRunning(false);
+            if (Array.isArray(ev.messages)) this.messages = ev.messages;
+            this.statusEl.className = 'nai-status';
+            this.statusEl.textContent = ev.stopReason === 'cancelled' ? 'Interrompu.' : ev.stopReason === 'max_tokens' ? 'Réponse tronquée.' : '';
+            const hasResult = !!this.result.trim();
+            this.panel.querySelector('.nai-apply').hidden = !hasResult;
+            this.panel.querySelector('[data-apply="replace-selection"]').hidden = !this.hasSelection();
+            if (hasResult) this.input.placeholder = 'Affiner le résultat… (ex. « plus court », « en liste »)';
+        } else if (ev.type === 'error') {
+            this.run = null;
+            this.setRunning(false);
+            this.statusEl.className = 'nai-status error';
+            this.statusEl.textContent = ev.message || 'Erreur inconnue.';
+            if (ev.needsKey) this.toggle(true);
+        }
+    }
+
+    async apply(kind) {
+        const md = this.result.trim();
+        if (!md) return;
+        if (kind === 'copy') {
+            try { await navigator.clipboard.writeText(md); this.notes.showToast('Résultat copié'); }
+            catch { this.notes.showToast('Copie impossible', null, null, 'warning'); }
+            return;
+        }
+        if (kind === 'new-note') return this.createNote(md);
+        if (!this.notes.currentFileId) { this.notes.showToast('Aucune note ouverte', null, null, 'warning'); return; }
+
+        const editor = this.notes.editor;
+        const html = naiMarkdownToHtml(md, true);
+        const sel = window.getSelection();
+        editor.focus({ preventScroll: true });
+        const range = document.createRange();
+        if (kind === 'replace-note') {
+            range.selectNodeContents(editor);
+        } else if (kind === 'replace-selection' && this.hasSelection()) {
+            range.setStart(this.savedRange.startContainer, this.savedRange.startOffset);
+            range.setEnd(this.savedRange.endContainer, this.savedRange.endOffset);
+        } else {
+            // Insérer après la sélection (ou le curseur), sinon à la fin de la note
+            if (this.savedRange && editor.contains(this.savedRange.commonAncestorContainer)) {
+                range.setStart(this.savedRange.endContainer, this.savedRange.endOffset);
+            } else {
+                range.selectNodeContents(editor);
+                range.collapse(false);
+            }
+            range.collapse(true);
+        }
+        sel.removeAllRanges();
+        sel.addRange(range);
+        // insertHTML garde l'historique d'annulation de l'éditeur (Ctrl+Z)
+        const block = kind === 'insert' && editor.textContent.trim() ? '<div><br></div>' + html : html;
+        if (!document.execCommand('insertHTML', false, block)) {
+            const frag = range.createContextualFragment(block);
+            range.deleteContents();
+            range.insertNode(frag);
+        }
+        await this.notes.saveCurrentFile();
+        this.notes.updateEmptyState?.();
+        this.notes.showToast(kind === 'replace-note' ? 'Note remplacée' : kind === 'replace-selection' ? 'Sélection remplacée' : 'Texte inséré');
+    }
+
+    createNote(md) {
+        const name = (this.lastAction ? this.lastAction.label : 'Claude') + ' — ' + (this.noteTitle() || 'note');
+        const file = { id: 'file_' + Date.now(), parentId: 'root', name, content: naiMarkdownToHtml(md, true), lastModified: Date.now() };
+        const tx = this.notes.db.transaction(['files'], 'readwrite');
+        tx.objectStore('files').add(file);
+        tx.oncomplete = () => {
+            this.notes.renderFileTree();
+            this.notes.loadFile(file.id);
+            this.notes.showToast(`Note « ${name} » créée`);
+        };
+    }
+}
+
+// Synchronisation : une note créée ou modifiée par Claude (assistant du navigateur ou MCP)
+// apparaît tout de suite dans la page d'accueil.
+function setupNotesSync(notes) {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const channel = new BroadcastChannel('zenith-notes');
+    channel.onmessage = (e) => {
+        const msg = e.data || {};
+        if (msg.type !== 'changed' || !notes.db) return;
+        notes.renderFileTree();
+        if (msg.id && msg.id === notes.currentFileId) {
+            if (document.activeElement === notes.editor) {
+                notes.showToast('Cette note a été modifiée par Claude', 'Recharger', () => notes.loadFile(msg.id));
+            } else {
+                notes.loadFile(msg.id);
+            }
+        }
+    };
+}
+
+(function initNotesAssistant() {
+    const notes = window.NotesModule;
+    const originalInit = notes.init.bind(notes);
+    notes.init = async function () {
+        // init() renseigne container/editor avant son premier await : l'assistant peut être créé
+        // tout de suite, sans attendre la base IndexedDB (qui peut tarder ou échouer si le
+        // profil est verrouillé par une autre instance de Zenith).
+        const pending = originalInit();
+        if (notes.container) {
+            notes.assistant = new NotesAssistant(notes);
+            notes.assistant.init();
+        }
+        try { await pending; } catch (e) {
+            console.error('Notes : base de données indisponible', e);
+            return;
+        }
+        if (!notes.container) return;
+        setupNotesSync(notes);
+        // Mettre à jour la portée quand on change de note
+        const originalLoad = notes.loadFile.bind(notes);
+        notes.loadFile = async (id) => { await originalLoad(id); setTimeout(() => notes.assistant?.updateScope(), 50); };
+    };
+})();
