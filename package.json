@@ -20,6 +20,9 @@
       "src/**/*",
       "assets/**/*"
     ],
+    "asarUnpack": [
+      "src/mcp.js"
+    ],
     "win": {
       "target": [
         "nsis",
@@ -51,10 +54,11 @@
   "author": "Zenith Team",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^28.0.0",
-    "electron-builder": "^24.9.1"
+    "electron": "45.4.1",
+    "electron-builder": "26.18.0"
   },
   "allowScripts": {
-    "electron@28.3.3": true
+    "electron@45.4.1": true,
+    "electron-winstaller": false
   }
 }
